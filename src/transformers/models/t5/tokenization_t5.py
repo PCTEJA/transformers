@@ -26,6 +26,26 @@ logger = logging.get_logger(__name__)
 
 VOCAB_FILES_NAMES = {"vocab_file": "spiece.model", "tokenizer_file": "tokenizer.json"}
 
+WHITESPACE_TOKENS = ("\n", "\t", "\r")
+
+
+def _vocab_has_explicit_whitespace_tokens(vocab) -> bool:
+    """Whether the vocabulary contains a piece for a whitespace character.
+
+    SentencePiece vocabularies that ship such a piece (e.g. MADLAD-400's "\\n") encode whitespace as a
+    regular token, so the pre-tokenizer must hand it to the Unigram model instead of discarding it.
+    Vocabularies without one keep the historical `WhitespaceSplit` behaviour, which the existing
+    integration tests rely on. `vocab` is a list of `(piece, score)` pairs as produced by the
+    tokenizer.json / SentencePiece loaders, or a `{piece: id}` dict as accepted by the constructor.
+    """
+    if isinstance(vocab, dict):
+        pieces = vocab.keys()
+    elif isinstance(vocab, list):
+        pieces = [item[0] if isinstance(item, (list, tuple)) else item for item in vocab]
+    else:
+        return False
+    return any(piece in WHITESPACE_TOKENS for piece in pieces)
+
 
 class T5Tokenizer(TokenizersBackend):
     """
@@ -120,11 +140,19 @@ class T5Tokenizer(TokenizersBackend):
         if _spm_precompiled_charsmap is not None:
             self._tokenizer.normalizer = normalizers.Precompiled(_spm_precompiled_charsmap)
 
-        self._tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
-            [
-                pre_tokenizers.WhitespaceSplit(),
-                pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always", split=True),
-            ]
+        # WhitespaceSplit discards whitespace before the Unigram model sees it, which drops pieces
+        # the vocabulary defines explicitly (e.g. MADLAD-400's "\n"). Only use it when the vocab
+        # has no such piece; this also matches SpmConverter, which builds Metaspace-only
+        # pre-tokenizers from SentencePiece models.
+        self._tokenizer.pre_tokenizer = (
+            pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always", split=True)
+            if _vocab_has_explicit_whitespace_tokens(self._vocab_scores)
+            else pre_tokenizers.Sequence(
+                [
+                    pre_tokenizers.WhitespaceSplit(),
+                    pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always", split=True),
+                ]
+            )
         )
         self._tokenizer.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always", split=True)
 
